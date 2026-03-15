@@ -17,6 +17,9 @@ import argparse
 import os
 import sys
 import re
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(override=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -119,6 +122,46 @@ def get_arxiv_paper(query:str, debug:bool=False) -> list[ArxivPaper]:
     return papers
 
 
+def load_sent_paper_ids(history_file: str) -> set[str]:
+    path = Path(history_file)
+    if not path.exists():
+        return set()
+
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except json.JSONDecodeError:
+        logger.warning(f"History file {path} is invalid JSON. Ignore it.")
+        return set()
+
+    ids = payload.get("sent_paper_ids", [])
+    if not isinstance(ids, list):
+        logger.warning(f"History file {path} has invalid sent_paper_ids. Ignore it.")
+        return set()
+
+    return {paper_id for paper_id in ids if isinstance(paper_id, str) and paper_id}
+
+
+def save_sent_paper_ids(history_file: str, sent_paper_ids: set[str]) -> None:
+    path = Path(history_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "sent_paper_ids": sorted(sent_paper_ids),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+
+def filter_sent_papers(papers: list[ArxivPaper], sent_paper_ids: set[str]) -> list[ArxivPaper]:
+    if not sent_paper_ids:
+        return papers
+
+    filtered_papers = [paper for paper in papers if paper.arxiv_id not in sent_paper_ids]
+    skipped_num = len(papers) - len(filtered_papers)
+    if skipped_num > 0:
+        logger.info(f"Skipped {skipped_num} papers already sent before.")
+    return filtered_papers
+
+
 
 parser = argparse.ArgumentParser(description='Recommender system for academic papers')
 
@@ -186,6 +229,12 @@ if __name__ == '__main__':
         help="Language of TLDR",
         default="English",
     )
+    add_argument(
+        "--history_file",
+        type=str,
+        help="Path of sent-paper history for deduplication across runs",
+        default=".state/sent_arxiv_ids.json",
+    )
     parser.add_argument('--debug', action='store_true', help='Debug mode')
     args = parser.parse_args()
     assert (
@@ -208,6 +257,11 @@ if __name__ == '__main__':
         logger.info(f"Remaining {len(corpus)} papers after filtering.")
     logger.info("Retrieving Arxiv papers...")
     papers = get_arxiv_paper(args.arxiv_query, args.debug)
+    if not args.debug:
+        sent_paper_ids = load_sent_paper_ids(args.history_file)
+        logger.info(f"Loaded {len(sent_paper_ids)} previously sent paper IDs from history.")
+        papers = filter_sent_papers(papers, sent_paper_ids)
+
     if len(papers) == 0:
         logger.info("No new papers found. Yesterday maybe a holiday and no one submit their work :). If this is not the case, please check the ARXIV_QUERY.")
         if not args.send_empty:
@@ -227,4 +281,8 @@ if __name__ == '__main__':
     html = render_email(papers)
     logger.info("Sending email...")
     send_email(args.sender, args.receiver, args.sender_password, args.smtp_server, args.smtp_port, html)
+    if not args.debug and len(papers) > 0:
+        sent_paper_ids.update(p.arxiv_id for p in papers)
+        save_sent_paper_ids(args.history_file, sent_paper_ids)
+        logger.info(f"Saved {len(sent_paper_ids)} sent paper IDs to {args.history_file}.")
     logger.success("Email sent successfully! If you don't receive the email, please check the configuration and the junk box.")
