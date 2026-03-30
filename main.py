@@ -17,6 +17,12 @@ import argparse
 import os
 import sys
 import re
+import json
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+import feedparser
+import requests
 from dotenv import load_dotenv
 load_dotenv(override=True)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -29,6 +35,15 @@ from gitignore_parser import parse_gitignore
 from tempfile import mkstemp
 from paper import ArxivPaper
 from llm import set_global_llm
+
+ARXIV_PAGE_SIZE = 50
+ARXIV_MIN_PAGE_SIZE = 10
+ARXIV_REQUEST_DELAY_SECONDS = 5.0
+ARXIV_RETRY_BASE_DELAY_SECONDS = 15.0
+ARXIV_MAX_BACKOFF_SECONDS = 120.0
+ARXIV_MAX_PAGE_FAILURES = 5
+ARXIV_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+ARXIV_USER_AGENT = "zotero-arxiv-daily/0.3.5 (+https://github.com/TideDra/zotero-arxiv-daily)"
 
 
 def build_arxiv_api_query(query: str) -> str:
@@ -72,8 +87,110 @@ def filter_corpus(corpus:list[dict], pattern:str) -> list[dict]:
     return new_corpus
 
 
+def iter_arxiv_results(search: arxiv.Search):
+    client = arxiv.Client(
+        page_size=ARXIV_PAGE_SIZE,
+        num_retries=0,
+        delay_seconds=ARXIV_REQUEST_DELAY_SECONDS,
+    )
+    start = 0
+    page_size = client.page_size
+    total_results = None
+    last_request_monotonic = None
+    failure_count = 0
+
+    while True:
+        remaining = None if search.max_results is None else search.max_results - start
+        if remaining is not None and remaining <= 0:
+            break
+
+        current_page_size = page_size if remaining is None else min(page_size, remaining)
+        if last_request_monotonic is not None:
+            sleep_seconds = client.delay_seconds - (time.monotonic() - last_request_monotonic)
+            if sleep_seconds > 0:
+                logger.info(f"Sleeping {sleep_seconds:.1f}s before the next arXiv request.")
+                time.sleep(sleep_seconds)
+
+        page_url = client._format_url(search, start, current_page_size)
+        logger.info(f"Requesting arXiv page: start={start}, size={current_page_size}")
+        request_started = time.monotonic()
+        try:
+            response = client._session.get(
+                page_url,
+                headers={"user-agent": ARXIV_USER_AGENT},
+                timeout=60,
+            )
+            last_request_monotonic = request_started
+            if response.status_code != requests.codes.OK:
+                raise arxiv.HTTPError(page_url, failure_count, response.status_code)
+
+            feed = feedparser.parse(response.content)
+            if len(feed.entries) == 0 and start > 0:
+                raise arxiv.UnexpectedEmptyPageError(page_url, failure_count, feed)
+        except (
+            arxiv.HTTPError,
+            arxiv.UnexpectedEmptyPageError,
+            requests.exceptions.RequestException,
+        ) as err:
+            last_request_monotonic = request_started
+            status = getattr(err, "status", None)
+            retryable = (
+                status in ARXIV_RETRYABLE_STATUS_CODES
+                or isinstance(err, arxiv.UnexpectedEmptyPageError)
+                or isinstance(err, requests.exceptions.RequestException)
+            )
+            if not retryable:
+                raise
+
+            failure_count += 1
+            if failure_count > ARXIV_MAX_PAGE_FAILURES:
+                logger.error(f"arXiv request failed too many times for page starting at {start}.")
+                raise
+
+            if status == 429 and page_size > ARXIV_MIN_PAGE_SIZE:
+                next_page_size = max(ARXIV_MIN_PAGE_SIZE, page_size // 2)
+                if next_page_size != page_size:
+                    logger.warning(
+                        f"arXiv rate limited the request. Reduce page size from {page_size} to {next_page_size}."
+                    )
+                    page_size = next_page_size
+
+            backoff_seconds = min(
+                ARXIV_RETRY_BASE_DELAY_SECONDS * (2 ** (failure_count - 1)),
+                ARXIV_MAX_BACKOFF_SECONDS,
+            )
+            logger.warning(
+                f"Retryable arXiv error ({err}). Backing off for {backoff_seconds:.1f}s "
+                f"before retry {failure_count}/{ARXIV_MAX_PAGE_FAILURES}."
+            )
+            time.sleep(backoff_seconds)
+            continue
+
+        failure_count = 0
+        if total_results is None:
+            total_results_raw = getattr(feed.feed, "opensearch_totalresults", None)
+            if total_results_raw is not None:
+                total_results = int(total_results_raw)
+                logger.info(
+                    f"Got first arXiv page: {len(feed.entries)} entries out of {total_results} total results."
+                )
+
+        if not feed.entries:
+            logger.warning("arXiv API returned no results.")
+            break
+
+        for entry in feed.entries:
+            try:
+                yield arxiv.Result._from_feed_entry(entry)
+            except arxiv.Result.MissingFieldError as err:
+                logger.warning(f"Skipping partial arXiv result: {err}")
+
+        start += len(feed.entries)
+        if total_results is not None and start >= total_results:
+            break
+
+
 def get_arxiv_paper(query:str, debug:bool=False) -> list[ArxivPaper]:
-    client = arxiv.Client(page_size=100, num_retries=10, delay_seconds=10)
     if not debug:
         search = arxiv.Search(
             query=build_arxiv_api_query(query),
@@ -84,7 +201,7 @@ def get_arxiv_paper(query:str, debug:bool=False) -> list[ArxivPaper]:
         papers = []
         seen_ids = set()
         latest_batch_date = None
-        for result in tqdm(client.results(search), desc="Retrieving Arxiv papers"):
+        for result in tqdm(iter_arxiv_results(search), desc="Retrieving Arxiv papers"):
             published = getattr(result, "published", None)
             if published is None:
                 continue
@@ -109,14 +226,59 @@ def get_arxiv_paper(query:str, debug:bool=False) -> list[ArxivPaper]:
 
     else:
         logger.debug("Retrieve 5 arxiv papers regardless of the date.")
-        search = arxiv.Search(query='cat:cs.AI', sort_by=arxiv.SortCriterion.SubmittedDate)
+        search = arxiv.Search(
+            query='cat:cs.AI',
+            max_results=5,
+            sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_order=arxiv.SortOrder.Descending,
+        )
         papers = []
-        for i in client.results(search):
+        for i in iter_arxiv_results(search):
             papers.append(ArxivPaper(i))
             if len(papers) == 5:
                 break
 
     return papers
+
+
+def load_sent_paper_ids(history_file: str) -> set[str]:
+    path = Path(history_file)
+    if not path.exists():
+        return set()
+
+    try:
+        payload = json.loads(path.read_text(encoding='utf-8'))
+    except json.JSONDecodeError:
+        logger.warning(f"History file {path} is invalid JSON. Ignore it.")
+        return set()
+
+    ids = payload.get("sent_paper_ids", [])
+    if not isinstance(ids, list):
+        logger.warning(f"History file {path} has invalid sent_paper_ids. Ignore it.")
+        return set()
+
+    return {paper_id for paper_id in ids if isinstance(paper_id, str) and paper_id}
+
+
+def save_sent_paper_ids(history_file: str, sent_paper_ids: set[str]) -> None:
+    path = Path(history_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "sent_paper_ids": sorted(sent_paper_ids),
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding='utf-8')
+
+
+def filter_sent_papers(papers: list[ArxivPaper], sent_paper_ids: set[str]) -> list[ArxivPaper]:
+    if not sent_paper_ids:
+        return papers
+
+    filtered_papers = [paper for paper in papers if paper.arxiv_id not in sent_paper_ids]
+    skipped_num = len(papers) - len(filtered_papers)
+    if skipped_num > 0:
+        logger.info(f"Skipped {skipped_num} papers already sent before.")
+    return filtered_papers
 
 
 
@@ -186,6 +348,12 @@ if __name__ == '__main__':
         help="Language of TLDR",
         default="English",
     )
+    add_argument(
+        "--history_file",
+        type=str,
+        help="Path of sent-paper history for deduplication across runs",
+        default=".state/sent_arxiv_ids.json",
+    )
     parser.add_argument('--debug', action='store_true', help='Debug mode')
     args = parser.parse_args()
     assert (
@@ -208,6 +376,11 @@ if __name__ == '__main__':
         logger.info(f"Remaining {len(corpus)} papers after filtering.")
     logger.info("Retrieving Arxiv papers...")
     papers = get_arxiv_paper(args.arxiv_query, args.debug)
+    if not args.debug:
+        sent_paper_ids = load_sent_paper_ids(args.history_file)
+        logger.info(f"Loaded {len(sent_paper_ids)} previously sent paper IDs from history.")
+        papers = filter_sent_papers(papers, sent_paper_ids)
+
     if len(papers) == 0:
         logger.info("No new papers found. Yesterday maybe a holiday and no one submit their work :). If this is not the case, please check the ARXIV_QUERY.")
         if not args.send_empty:
@@ -227,4 +400,8 @@ if __name__ == '__main__':
     html = render_email(papers)
     logger.info("Sending email...")
     send_email(args.sender, args.receiver, args.sender_password, args.smtp_server, args.smtp_port, html)
+    if not args.debug and len(papers) > 0:
+        sent_paper_ids.update(p.arxiv_id for p in papers)
+        save_sent_paper_ids(args.history_file, sent_paper_ids)
+        logger.info(f"Saved {len(sent_paper_ids)} sent paper IDs to {args.history_file}.")
     logger.success("Email sent successfully! If you don't receive the email, please check the configuration and the junk box.")

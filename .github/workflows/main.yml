@@ -17,6 +17,14 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
 
+      - name: Restore sent paper history
+        uses: actions/cache/restore@v4
+        with:
+          path: .state
+          key: sent-paper-history-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            sent-paper-history-${{ github.repository }}-${{ github.ref_name }}-
+
       - name: Detect entrypoint
         run: |
           pwd
@@ -56,3 +64,10 @@ jobs:
           LANGUAGE: ${{ vars.LANGUAGE }}
         run: |
           uv run python "${ENTRYPOINT}"
+
+      - name: Save sent paper history
+        if: ${{ always() && hashFiles('.state/**') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .state
+          key: sent-paper-history-${{ github.repository }}-${{ github.ref_name }}-${{ github.run_id }}
